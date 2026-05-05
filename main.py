@@ -6,6 +6,7 @@ Kiedex Auto Trading Bot — Backend (Single File)
 - Trade execution via Supabase Edge Functions (kiedex.app)
 - 2 akun trade secara bersamaan (akun A & B)
 - Analisa 1 coin → open di 2 akun → hold/close AI loop → cari coin berikutnya
+- Auto JWT refresh token (tidak perlu update manual)
 - WebSocket server untuk frontend monitoring
 - REST API: start/stop bot, set config
 
@@ -19,10 +20,9 @@ import logging
 import os
 import time
 import uuid
-import hmac
-import hashlib
 import re
 import random
+from base64 import urlsafe_b64decode
 from typing import Optional, Dict, List
 from datetime import datetime, timezone
 
@@ -46,11 +46,14 @@ logger = logging.getLogger("bot")
 # ENV CONFIG
 # ─────────────────────────────────────────────
 # Akun A
-ACCOUNT_A_JWT   = os.getenv("ACCOUNT_A_JWT", "")
-ACCOUNT_A_UID   = os.getenv("ACCOUNT_A_UID", "")
+ACCOUNT_A_JWT           = os.getenv("ACCOUNT_A_JWT", "")
+ACCOUNT_A_REFRESH_TOKEN = os.getenv("ACCOUNT_A_REFRESH_TOKEN", "")
+ACCOUNT_A_UID           = os.getenv("ACCOUNT_A_UID", "")
+
 # Akun B
-ACCOUNT_B_JWT   = os.getenv("ACCOUNT_B_JWT", "")
-ACCOUNT_B_UID   = os.getenv("ACCOUNT_B_UID", "")
+ACCOUNT_B_JWT           = os.getenv("ACCOUNT_B_JWT", "")
+ACCOUNT_B_REFRESH_TOKEN = os.getenv("ACCOUNT_B_REFRESH_TOKEN", "")
+ACCOUNT_B_UID           = os.getenv("ACCOUNT_B_UID", "")
 
 SUPABASE_URL    = os.getenv("SUPABASE_URL", "https://ffcsrzbwbuzhboyyloam.supabase.co")
 SUPABASE_APIKEY = os.getenv("SUPABASE_APIKEY", "sb_publishable_ZN-MbrdVe1UcfCHwl-I2aw_DFZ2aWDf")
@@ -61,12 +64,12 @@ QWEN_TOKEN_2 = os.getenv("QWEN_TOKEN_2", "")
 QWEN_MODEL   = os.getenv("QWEN_MODEL", "qwen3-max")
 
 # Bot default settings (dapat di-override via API)
-DEFAULT_MARGIN    = float(os.getenv("DEFAULT_MARGIN", "50"))
-DEFAULT_LEVERAGE  = int(os.getenv("DEFAULT_LEVERAGE", "5"))
+DEFAULT_MARGIN   = float(os.getenv("DEFAULT_MARGIN", "50"))
+DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "5"))
 
 MEXC_BASE_URL = "https://contract.mexc.com"
 MEXC_WS_URL   = "wss://contract.mexc.com/edge"
-HTTP_PORT      = int(os.getenv("PORT", "8000"))
+HTTP_PORT     = int(os.getenv("PORT", "8000"))
 
 # Coin yang tersedia di kiedex.app (simbol MEXC format)
 AVAILABLE_COINS = [
@@ -95,6 +98,120 @@ INTERVAL_SECONDS = {
 }
 
 # ─────────────────────────────────────────────
+# Token Manager — Auto Refresh JWT
+# ─────────────────────────────────────────────
+class TokenManager:
+    """
+    Menyimpan JWT + refresh token untuk 2 akun.
+    Auto-refresh kalau JWT expired atau mau expired dalam 5 menit.
+    """
+    def __init__(self):
+        self._tokens: Dict[str, Dict[str, str]] = {
+            "A": {
+                "jwt":     ACCOUNT_A_JWT,
+                "refresh": ACCOUNT_A_REFRESH_TOKEN,
+                "uid":     ACCOUNT_A_UID,
+            },
+            "B": {
+                "jwt":     ACCOUNT_B_JWT,
+                "refresh": ACCOUNT_B_REFRESH_TOKEN,
+                "uid":     ACCOUNT_B_UID,
+            },
+        }
+        self._lock = asyncio.Lock()
+
+    def _decode_exp(self, jwt: str) -> int:
+        """Ambil expiry time dari JWT payload (unix timestamp)."""
+        try:
+            payload = jwt.split(".")[1]
+            decoded = urlsafe_b64decode(payload + "==").decode("utf-8")
+            return json.loads(decoded).get("exp", 0)
+        except Exception:
+            return 0
+
+    def _is_expired(self, jwt: str, buffer_seconds: int = 300) -> bool:
+        """Return True kalau JWT sudah expired atau akan expired dalam buffer_seconds."""
+        exp = self._decode_exp(jwt)
+        return int(time.time()) >= (exp - buffer_seconds)
+
+    async def _do_refresh(self, account_key: str) -> bool:
+        """Panggil Supabase refresh token endpoint. Return True jika berhasil."""
+        refresh_token = self._tokens[account_key]["refresh"]
+        if not refresh_token:
+            logger.warning(f"No refresh token configured for account {account_key}")
+            return False
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{SUPABASE_URL}/auth/v1/token",
+                    headers={
+                        "apikey": SUPABASE_APIKEY,
+                        "Content-Type": "application/json",
+                        "X-Client-Info": "supabase-js-web/2.90.1",
+                    },
+                    params={"grant_type": "refresh_token"},
+                    json={"refresh_token": refresh_token},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+                new_jwt     = data.get("access_token", "")
+                new_refresh = data.get("refresh_token", "")
+
+                if not new_jwt:
+                    logger.error(f"Refresh returned empty access_token for account {account_key}")
+                    return False
+
+                self._tokens[account_key]["jwt"]     = new_jwt
+                self._tokens[account_key]["refresh"] = new_refresh
+
+                exp = self._decode_exp(new_jwt)
+                exp_str = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%H:%M:%S UTC")
+                logger.info(f"✅ Account {account_key} JWT refreshed — expires at {exp_str}")
+                return True
+
+        except Exception as e:
+            logger.error(f"❌ Failed to refresh token for account {account_key}: {e}")
+            return False
+
+    async def get_jwt(self, account_key: str) -> str:
+        """
+        Return JWT yang valid untuk akun tertentu.
+        Otomatis refresh kalau expired / mau expired.
+        Thread-safe via asyncio.Lock.
+        """
+        async with self._lock:
+            jwt = self._tokens[account_key]["jwt"]
+
+            if not jwt:
+                return ""
+
+            if self._is_expired(jwt):
+                logger.info(f"🔄 Account {account_key} JWT expired — refreshing...")
+                ok = await self._do_refresh(account_key)
+                if ok:
+                    jwt = self._tokens[account_key]["jwt"]
+                else:
+                    logger.warning(f"⚠️ Using old JWT for account {account_key} (refresh failed)")
+
+            return jwt
+
+    def get_uid(self, account_key: str) -> str:
+        return self._tokens[account_key].get("uid", "")
+
+    def update_from_env(self):
+        """Reload token dari env vars (berguna kalau env di-update runtime)."""
+        self._tokens["A"]["jwt"]     = os.getenv("ACCOUNT_A_JWT", self._tokens["A"]["jwt"])
+        self._tokens["A"]["refresh"] = os.getenv("ACCOUNT_A_REFRESH_TOKEN", self._tokens["A"]["refresh"])
+        self._tokens["B"]["jwt"]     = os.getenv("ACCOUNT_B_JWT", self._tokens["B"]["jwt"])
+        self._tokens["B"]["refresh"] = os.getenv("ACCOUNT_B_REFRESH_TOKEN", self._tokens["B"]["refresh"])
+
+
+token_manager = TokenManager()
+
+
+# ─────────────────────────────────────────────
 # Global State
 # ─────────────────────────────────────────────
 class BotState:
@@ -102,10 +219,10 @@ class BotState:
     margin: float = DEFAULT_MARGIN
     leverage: int = DEFAULT_LEVERAGE
     current_coin: Optional[str] = None
-    position_a: Optional[dict] = None   # {positionId, symbol, side, entry, tp, sl}
+    position_a: Optional[dict] = None
     position_b: Optional[dict] = None
     live_price: Dict[str, float] = {}
-    status: str = "idle"                # idle | analyzing | in_trade | closing
+    status: str = "idle"
     last_analysis: Optional[dict] = None
     logs: List[str] = []
     ws_clients: set = set()
@@ -116,6 +233,7 @@ class BotState:
         if cls._lock is None:
             cls._lock = asyncio.Lock()
         return cls._lock
+
 
 state = BotState()
 
@@ -177,12 +295,12 @@ async def fetch_candles(symbol: str, granularity: str, limit: int = 150) -> list
             if not isinstance(data, dict):
                 return []
 
-            times   = data.get("time",   [])
-            opens   = data.get("open",   [])
-            highs   = data.get("high",   [])
-            lows    = data.get("low",    [])
-            closes  = data.get("close",  [])
-            vols    = data.get("vol",    [])
+            times  = data.get("time",  [])
+            opens  = data.get("open",  [])
+            highs  = data.get("high",  [])
+            lows   = data.get("low",   [])
+            closes = data.get("close", [])
+            vols   = data.get("vol",   [])
 
             candles = []
             for i in range(len(times)):
@@ -204,7 +322,6 @@ async def fetch_candles(symbol: str, granularity: str, limit: int = 150) -> list
 
 
 async def fetch_all_candles(symbol: str) -> dict:
-    """Fetch all timeframes concurrently."""
     tasks = {tf: asyncio.create_task(fetch_candles(symbol, tf)) for tf in TIMEFRAMES}
     result = {}
     for tf, task in tasks.items():
@@ -268,7 +385,6 @@ class MexcPriceFeed:
                     backoff = 2
                     log("📡 MEXC WS connected")
 
-                    # Subscribe bulk tickers
                     await ws.send(json.dumps({
                         "method": "sub.tickers", "param": {}, "gzip": False
                     }))
@@ -315,7 +431,6 @@ class MexcPriceFeed:
                 price = item.get("lastPrice")
                 if sym and price:
                     state.live_price[sym] = float(price)
-                    # Broadcast live price update for current coin
                     if sym == state.current_coin:
                         asyncio.create_task(broadcast({
                             "type": "price",
@@ -339,9 +454,10 @@ price_feed = MexcPriceFeed()
 
 
 # ─────────────────────────────────────────────
-# Qwen Reverse API (testt.py style)
+# Qwen Reverse API
 # ─────────────────────────────────────────────
 QWEN_BASE_URL_REVERSE = "https://chat.qwen.ai"
+
 
 def _qwen_headers(token: str, chat_id: str = None) -> dict:
     h = {
@@ -496,6 +612,7 @@ Strategy rules:
 
 You must respond in VALID JSON only, no markdown, no preamble."""
 
+
 def build_analysis_prompt(symbol: str, candles_by_tf: dict, current_price: float) -> str:
     kiedex_sym = MEXC_TO_KIEDEX.get(symbol, symbol)
     blocks = []
@@ -569,6 +686,7 @@ Decision rules:
 - CLOSE if: PnL > 1% profit (take profit early if structure shows reversal)
 - HOLD if: PnL is small negative but structure still valid
 - Be PROFIT-SEEKING: close at good profit, don't let winners turn to losers
+- Prioritize locking in profit over holding for maximum gain
 
 Respond ONLY in JSON:
 {{
@@ -578,7 +696,7 @@ Respond ONLY in JSON:
 
 
 # ─────────────────────────────────────────────
-# AI Call — full flow
+# AI Call
 # ─────────────────────────────────────────────
 async def call_qwen(prompt: str) -> str:
     token = _get_qwen_token()
@@ -601,9 +719,7 @@ def parse_json_from_text(text: str) -> Optional[dict]:
     try:
         return json.loads(text[start:end])
     except Exception:
-        # Try to clean up common issues
         snippet = text[start:end]
-        # Remove trailing commas
         snippet = re.sub(r",\s*([}\]])", r"\1", snippet)
         try:
             return json.loads(snippet)
@@ -612,18 +728,28 @@ def parse_json_from_text(text: str) -> Optional[dict]:
 
 
 # ─────────────────────────────────────────────
-# Supabase Trade Execution
+# Supabase Trade Execution (pakai token_manager)
 # ─────────────────────────────────────────────
-async def execute_trade(jwt: str, symbol: str, side: str, margin: float, leverage: int,
-                         tp: Optional[float], sl: Optional[float]) -> Optional[dict]:
-    kiedex_sym = MEXC_TO_KIEDEX.get(symbol, symbol)
-    headers = {
+def _trade_headers(jwt: str) -> dict:
+    return {
         "apikey": SUPABASE_APIKEY,
         "authorization": f"Bearer {jwt}",
         "content-type": "application/json",
         "origin": "https://kiedex.app",
         "referer": "https://kiedex.app/",
+        "X-Client-Info": "supabase-js-web/2.90.1",
     }
+
+
+async def execute_trade(account_key: str, symbol: str, side: str, margin: float, leverage: int,
+                        tp: Optional[float], sl: Optional[float]) -> Optional[dict]:
+    """Execute trade untuk akun A atau B. Auto-refresh JWT kalau perlu."""
+    jwt = await token_manager.get_jwt(account_key)
+    if not jwt:
+        logger.error(f"execute_trade: no JWT for account {account_key}")
+        return None
+
+    kiedex_sym = MEXC_TO_KIEDEX.get(symbol, symbol)
     payload = {
         "symbol": kiedex_sym,
         "side": side,
@@ -636,9 +762,20 @@ async def execute_trade(jwt: str, symbol: str, side: str, margin: float, leverag
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{SUPABASE_URL}/functions/v1/execute-trade",
-                headers=headers,
+                headers=_trade_headers(jwt),
                 json=payload,
             )
+            # Kalau 401, coba refresh sekali lagi lalu retry
+            if resp.status_code == 401:
+                logger.warning(f"execute_trade 401 for account {account_key} — forcing refresh...")
+                ok = await token_manager._do_refresh(account_key)
+                if ok:
+                    jwt = await token_manager.get_jwt(account_key)
+                    resp = await client.post(
+                        f"{SUPABASE_URL}/functions/v1/execute-trade",
+                        headers=_trade_headers(jwt),
+                        json=payload,
+                    )
             resp.raise_for_status()
             data = resp.json()
             if data.get("success"):
@@ -646,25 +783,35 @@ async def execute_trade(jwt: str, symbol: str, side: str, margin: float, leverag
             logger.error(f"execute_trade failed: {data}")
             return None
     except Exception as e:
-        logger.error(f"execute_trade exception: {e}")
+        logger.error(f"execute_trade exception (account {account_key}): {e}")
         return None
 
 
-async def close_trade(jwt: str, position_id: str) -> Optional[dict]:
-    headers = {
-        "apikey": SUPABASE_APIKEY,
-        "authorization": f"Bearer {jwt}",
-        "content-type": "application/json",
-        "origin": "https://kiedex.app",
-        "referer": "https://kiedex.app/",
-    }
+async def close_trade(account_key: str, position_id: str) -> Optional[dict]:
+    """Close trade untuk akun A atau B. Auto-refresh JWT kalau perlu."""
+    jwt = await token_manager.get_jwt(account_key)
+    if not jwt:
+        logger.error(f"close_trade: no JWT for account {account_key}")
+        return None
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{SUPABASE_URL}/functions/v1/close-trade",
-                headers=headers,
+                headers=_trade_headers(jwt),
                 json={"positionId": position_id, "reason": "bot"},
             )
+            # Kalau 401, refresh dan retry
+            if resp.status_code == 401:
+                logger.warning(f"close_trade 401 for account {account_key} — forcing refresh...")
+                ok = await token_manager._do_refresh(account_key)
+                if ok:
+                    jwt = await token_manager.get_jwt(account_key)
+                    resp = await client.post(
+                        f"{SUPABASE_URL}/functions/v1/close-trade",
+                        headers=_trade_headers(jwt),
+                        json={"positionId": position_id, "reason": "bot"},
+                    )
             resp.raise_for_status()
             data = resp.json()
             if data.get("success"):
@@ -672,16 +819,25 @@ async def close_trade(jwt: str, position_id: str) -> Optional[dict]:
             logger.error(f"close_trade failed: {data}")
             return None
     except Exception as e:
-        logger.error(f"close_trade exception: {e}")
+        logger.error(f"close_trade exception (account {account_key}): {e}")
         return None
 
 
-async def get_trade_history(jwt: str, uid: str, limit: int = 20) -> list:
+async def get_trade_history(account_key: str, limit: int = 20) -> list:
+    """Ambil history trade untuk akun A atau B."""
+    jwt = await token_manager.get_jwt(account_key)
+    uid = token_manager.get_uid(account_key)
+
+    if not jwt or not uid:
+        logger.warning(f"get_trade_history: missing jwt/uid for account {account_key}")
+        return []
+
     headers = {
         "apikey": SUPABASE_APIKEY,
         "authorization": f"Bearer {jwt}",
         "accept-profile": "public",
         "origin": "https://kiedex.app",
+        "X-Client-Info": "supabase-js-web/2.90.1",
     }
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -696,19 +852,34 @@ async def get_trade_history(jwt: str, uid: str, limit: int = 20) -> list:
                     "limit": str(limit),
                 },
             )
+            if resp.status_code == 401:
+                logger.warning(f"get_trade_history 401 for account {account_key} — forcing refresh...")
+                ok = await token_manager._do_refresh(account_key)
+                if ok:
+                    jwt = await token_manager.get_jwt(account_key)
+                    headers["authorization"] = f"Bearer {jwt}"
+                    resp = await client.get(
+                        f"{SUPABASE_URL}/rest/v1/trades_history",
+                        headers=headers,
+                        params={
+                            "select": "*",
+                            "user_id": f"eq.{uid}",
+                            "order": "closed_at.desc",
+                            "offset": "0",
+                            "limit": str(limit),
+                        },
+                    )
             resp.raise_for_status()
             return resp.json()
     except Exception as e:
-        logger.error(f"get_trade_history error: {e}")
+        logger.error(f"get_trade_history error (account {account_key}): {e}")
         return []
 
 
 # ─────────────────────────────────────────────
 # Core Bot Logic
 # ─────────────────────────────────────────────
-
 async def select_coin() -> Optional[str]:
-    """Pick a coin with the strongest trend from the available list."""
     log("🔍 Scanning coins for best setup...")
     state.status = "analyzing"
     await broadcast_state()
@@ -716,7 +887,6 @@ async def select_coin() -> Optional[str]:
     best_coin = None
     best_confidence = 0
 
-    # Shuffle to avoid always picking same coin
     coins = AVAILABLE_COINS.copy()
     random.shuffle(coins)
 
@@ -727,7 +897,6 @@ async def select_coin() -> Optional[str]:
             candles = await fetch_all_candles(symbol)
             current_price = state.live_price.get(symbol)
             if not current_price:
-                # Get from 5m candle last close
                 c5 = candles.get("5m", [])
                 if c5:
                     current_price = float(c5[-1][4])
@@ -763,7 +932,6 @@ async def select_coin() -> Optional[str]:
                 }
                 await broadcast_state()
 
-            # Stop scanning once we find high-confidence trade
             if confidence >= 75:
                 log(f"✅ High confidence found: {MEXC_TO_KIEDEX.get(symbol, symbol)} ({confidence}%)")
                 break
@@ -776,7 +944,6 @@ async def select_coin() -> Optional[str]:
 
 
 async def open_positions(symbol: str, analysis: dict):
-    """Open trade on both accounts simultaneously."""
     side = analysis.get("decision", "LONG").lower()
     tp = analysis.get("tp")
     sl = analysis.get("sl")
@@ -784,13 +951,12 @@ async def open_positions(symbol: str, analysis: dict):
     log(f"🚀 Opening {side.upper()} on {MEXC_TO_KIEDEX.get(symbol, symbol)} | margin={state.margin} lev={state.leverage}x")
     log(f"   TP={tp} | SL={sl}")
 
-    # Open on both accounts concurrently
-    task_a = asyncio.create_task(execute_trade(
-        ACCOUNT_A_JWT, symbol, side, state.margin, state.leverage, tp, sl
-    ))
-    task_b = asyncio.create_task(execute_trade(
-        ACCOUNT_B_JWT, symbol, side, state.margin, state.leverage, tp, sl
-    ))
+    task_a = asyncio.create_task(
+        execute_trade("A", symbol, side, state.margin, state.leverage, tp, sl)
+    )
+    task_b = asyncio.create_task(
+        execute_trade("B", symbol, side, state.margin, state.leverage, tp, sl)
+    )
 
     result_a, result_b = await asyncio.gather(task_a, task_b, return_exceptions=True)
 
@@ -835,7 +1001,6 @@ async def open_positions(symbol: str, analysis: dict):
 
 
 async def close_positions(reason: str = "bot"):
-    """Close both positions simultaneously."""
     if not (state.position_a or state.position_b):
         return
 
@@ -844,12 +1009,16 @@ async def close_positions(reason: str = "bot"):
 
     tasks = []
     if state.position_a:
-        tasks.append(asyncio.create_task(close_trade(ACCOUNT_A_JWT, state.position_a["positionId"])))
+        tasks.append(asyncio.create_task(
+            close_trade("A", state.position_a["positionId"])
+        ))
     else:
         tasks.append(asyncio.create_task(asyncio.sleep(0)))
 
     if state.position_b:
-        tasks.append(asyncio.create_task(close_trade(ACCOUNT_B_JWT, state.position_b["positionId"])))
+        tasks.append(asyncio.create_task(
+            close_trade("B", state.position_b["positionId"])
+        ))
     else:
         tasks.append(asyncio.create_task(asyncio.sleep(0)))
 
@@ -870,7 +1039,6 @@ async def close_positions(reason: str = "bot"):
 
 
 async def hold_close_loop():
-    """AI monitoring loop while in trade. Check every 30s."""
     while state.running and (state.position_a or state.position_b):
         await asyncio.sleep(30)
 
@@ -885,14 +1053,12 @@ async def hold_close_loop():
         if not current_price:
             continue
 
-        # Use whichever position is still open
         pos = state.position_a or state.position_b
         entry = pos.get("entry", current_price)
         side = pos.get("side", "long")
         tp = pos.get("tp")
         sl = pos.get("sl")
 
-        # Calculate PnL %
         if side == "long":
             pnl_pct = ((current_price - entry) / entry) * 100 * state.leverage
         else:
@@ -900,7 +1066,6 @@ async def hold_close_loop():
 
         log(f"📈 Monitor {MEXC_TO_KIEDEX.get(symbol, symbol)} | price={current_price:.4f} pnl={pnl_pct:.2f}%")
 
-        # Auto close if TP/SL hit
         if tp and sl:
             if side == "long":
                 if current_price >= tp:
@@ -921,7 +1086,6 @@ async def hold_close_loop():
                     await close_positions("sl_hit")
                     return
 
-        # AI hold/close decision every 2 minutes
         try:
             candles_15m = await fetch_candles(symbol, "15m", 30)
             prompt = build_hold_close_prompt(
@@ -940,7 +1104,7 @@ async def hold_close_loop():
         except Exception as e:
             log(f"⚠️ Hold/close AI error: {e}", "WARNING")
 
-        await asyncio.sleep(90)  # Check again in 90s (total ~2min)
+        await asyncio.sleep(90)
 
 
 # ─────────────────────────────────────────────
@@ -952,7 +1116,6 @@ async def bot_loop():
 
     while state.running:
         try:
-            # Step 1: Find best coin
             coin = await select_coin()
 
             if not state.running:
@@ -967,7 +1130,6 @@ async def bot_loop():
 
             analysis = state.last_analysis
 
-            # Step 2: Open on both accounts
             await open_positions(coin, analysis)
 
             if not state.position_a and not state.position_b:
@@ -978,7 +1140,6 @@ async def bot_loop():
                 await asyncio.sleep(30)
                 continue
 
-            # Step 3: Monitor until close
             log(f"👀 Monitoring {MEXC_TO_KIEDEX.get(coin, coin)} position...")
             await hold_close_loop()
 
@@ -994,7 +1155,6 @@ async def bot_loop():
             log(f"❌ Bot loop error: {e}", "ERROR")
             await asyncio.sleep(10)
 
-    # Cleanup
     if state.position_a or state.position_b:
         log("⚠️ Bot stopping — closing open positions...")
         await close_positions("bot_stopped")
@@ -1037,8 +1197,11 @@ async def start_bot(config: BotConfig = None):
     global _bot_task
     if state.running:
         raise HTTPException(400, "Bot already running")
-    if not ACCOUNT_A_JWT or not ACCOUNT_B_JWT:
-        raise HTTPException(400, "Account JWTs not configured")
+
+    jwt_a = await token_manager.get_jwt("A")
+    jwt_b = await token_manager.get_jwt("B")
+    if not jwt_a or not jwt_b:
+        raise HTTPException(400, "Account JWTs not configured or refresh failed")
     if not QWEN_TOKEN_1:
         raise HTTPException(400, "QWEN_TOKEN_1 not configured")
 
@@ -1102,17 +1265,13 @@ async def get_status():
 
 @app.get("/history")
 async def get_history():
-    if not ACCOUNT_A_JWT or not ACCOUNT_A_UID:
-        return {"trades": []}
-    trades = await get_trade_history(ACCOUNT_A_JWT, ACCOUNT_A_UID, 50)
+    trades = await get_trade_history("A", 50)
     return {"trades": trades}
 
 
 @app.get("/history/b")
 async def get_history_b():
-    if not ACCOUNT_B_JWT or not ACCOUNT_B_UID:
-        return {"trades": []}
-    trades = await get_trade_history(ACCOUNT_B_JWT, ACCOUNT_B_UID, 50)
+    trades = await get_trade_history("B", 50)
     return {"trades": trades}
 
 
@@ -1125,7 +1284,7 @@ async def manual_close():
 
 
 # ─────────────────────────────────────────────
-# WebSocket Endpoint (FastAPI — same port as HTTP)
+# WebSocket Endpoint
 # ─────────────────────────────────────────────
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -1133,7 +1292,6 @@ async def websocket_endpoint(websocket: WebSocket):
     state.ws_clients.add(websocket)
     log(f"🔌 Frontend connected ({len(state.ws_clients)} clients)")
     try:
-        # Send current state on connect
         await websocket.send_json({
             "type": "state",
             "running": state.running,
@@ -1146,12 +1304,10 @@ async def websocket_endpoint(websocket: WebSocket):
             "live_price": state.live_price,
             "last_analysis": state.last_analysis,
         })
-        # Send recent logs
         await websocket.send_json({
             "type": "logs",
             "logs": state.logs[-50:],
         })
-        # Keep connection alive, handle incoming messages
         while True:
             try:
                 data = await websocket.receive_json()
@@ -1171,8 +1327,15 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.on_event("startup")
 async def startup():
     log("⚡ Kiedex Bot backend starting...")
+
+    # Cek & refresh token saat startup kalau sudah expired
+    for key in ("A", "B"):
+        jwt = token_manager._tokens[key]["jwt"]
+        if jwt and token_manager._is_expired(jwt):
+            log(f"🔄 Account {key} JWT expired on startup — refreshing...")
+            await token_manager._do_refresh(key)
+
     await price_feed.start()
-    # Subscribe all available coins for live prices
     for sym in AVAILABLE_COINS:
         price_feed.subscribe(sym)
     log(f"📡 Subscribed to {len(AVAILABLE_COINS)} coins")
@@ -1197,3 +1360,25 @@ if __name__ == "__main__":
         log_level="info",
         reload=False,
     )
+
+# ─────────────────────────────────────────────
+# ENV VARS YANG DIBUTUHKAN DI RAILWAY:
+# ─────────────────────────────────────────────
+# ACCOUNT_A_JWT           = eyJhbGci...        (JWT akun A, bisa expired — akan auto refresh)
+# ACCOUNT_A_REFRESH_TOKEN = <refresh_token_A>  (dari accounts.json atau DevTools)
+# ACCOUNT_A_UID           = <user_id_A>        (UUID akun A)
+#
+# ACCOUNT_B_JWT           = eyJhbGci...        (JWT akun B, bisa expired — akan auto refresh)
+# ACCOUNT_B_REFRESH_TOKEN = <refresh_token_B>  (dari accounts.json atau DevTools)
+# ACCOUNT_B_UID           = <user_id_B>        (UUID akun B)
+#
+# SUPABASE_URL    = https://ffcsrzbwbuzhboyyloam.supabase.co
+# SUPABASE_APIKEY = sb_publishable_ZN-MbrdVe1UcfCHwl-I2aw_DFZ2aWDf
+#
+# QWEN_TOKEN_1    = <token_qwen_1>
+# QWEN_TOKEN_2    = <token_qwen_2>  (opsional, untuk fallback)
+# QWEN_MODEL      = qwen3-max
+#
+# DEFAULT_MARGIN  = 50
+# DEFAULT_LEVERAGE= 5
+# PORT            = 8000
