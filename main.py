@@ -28,9 +28,7 @@ from datetime import datetime, timezone
 
 import httpx
 import websockets
-from websockets.server import serve as ws_serve
-from websockets.exceptions import ConnectionClosed
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -68,7 +66,6 @@ DEFAULT_LEVERAGE  = int(os.getenv("DEFAULT_LEVERAGE", "5"))
 
 MEXC_BASE_URL = "https://contract.mexc.com"
 MEXC_WS_URL   = "wss://contract.mexc.com/edge"
-WS_SERVER_PORT = int(os.getenv("WS_PORT", "8765"))
 HTTP_PORT      = int(os.getenv("PORT", "8000"))
 
 # Coin yang tersedia di kiedex.app (simbol MEXC format)
@@ -136,11 +133,10 @@ def log(msg: str, level: str = "INFO"):
 async def broadcast(data: dict):
     if not state.ws_clients:
         return
-    msg = json.dumps(data)
     dead = set()
     for ws in state.ws_clients.copy():
         try:
-            await ws.send(msg)
+            await ws.send_json(data)
         except Exception:
             dead.add(ws)
     state.ws_clients -= dead
@@ -1127,14 +1123,16 @@ async def manual_close():
 
 
 # ─────────────────────────────────────────────
-# WebSocket Server (for frontend real-time)
+# WebSocket Endpoint (FastAPI — same port as HTTP)
 # ─────────────────────────────────────────────
-async def ws_handler(websocket):
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
     state.ws_clients.add(websocket)
     log(f"🔌 Frontend connected ({len(state.ws_clients)} clients)")
     try:
         # Send current state on connect
-        await websocket.send(json.dumps({
+        await websocket.send_json({
             "type": "state",
             "running": state.running,
             "status": state.status,
@@ -1145,35 +1143,28 @@ async def ws_handler(websocket):
             "position_b": state.position_b,
             "live_price": state.live_price,
             "last_analysis": state.last_analysis,
-        }))
+        })
         # Send recent logs
-        await websocket.send(json.dumps({
+        await websocket.send_json({
             "type": "logs",
             "logs": state.logs[-50:],
-        }))
-        # Keep connection alive
-        async for msg in websocket:
+        })
+        # Keep connection alive, handle incoming messages
+        while True:
             try:
-                data = json.loads(msg)
-                cmd = data.get("cmd")
-                if cmd == "ping":
-                    await websocket.send(json.dumps({"type": "pong"}))
+                data = await websocket.receive_json()
+                if data.get("cmd") == "ping":
+                    await websocket.send_json({"type": "pong"})
             except Exception:
-                pass
-    except ConnectionClosed:
+                break
+    except WebSocketDisconnect:
         pass
     finally:
         state.ws_clients.discard(websocket)
 
 
-async def start_ws_server():
-    log(f"🔌 WebSocket server starting on port {WS_SERVER_PORT}")
-    async with ws_serve(ws_handler, "0.0.0.0", WS_SERVER_PORT):
-        await asyncio.Future()  # run forever
-
-
 # ─────────────────────────────────────────────
-# Startup
+# Startup / Shutdown
 # ─────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
@@ -1183,10 +1174,7 @@ async def startup():
     for sym in AVAILABLE_COINS:
         price_feed.subscribe(sym)
     log(f"📡 Subscribed to {len(AVAILABLE_COINS)} coins")
-
-    # Start WebSocket server in background
-    asyncio.create_task(start_ws_server(), name="ws_server")
-    log(f"✅ Backend ready | HTTP:{HTTP_PORT} | WS:{WS_SERVER_PORT}")
+    log(f"✅ Backend ready | HTTP+WS on port {HTTP_PORT}")
 
 
 @app.on_event("shutdown")
@@ -1201,7 +1189,7 @@ async def shutdown():
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run(
-        "bot:app",
+        "main:app",
         host="0.0.0.0",
         port=HTTP_PORT,
         log_level="info",
