@@ -690,7 +690,7 @@ async def get_trade_history(jwt: str, uid: str, limit: int = 20) -> list:
                 headers=headers,
                 params={
                     "select": "*",
-                    f"user_id": f"eq.{uid}",
+                    "user_id": f"eq.{uid}",
                     "order": "closed_at.desc",
                     "offset": "0",
                     "limit": str(limit),
